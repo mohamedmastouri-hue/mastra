@@ -1,8 +1,10 @@
 import { stepCountIs } from '@internal/ai-sdk-v5';
 import { it, expect } from 'vitest';
 import { z } from 'zod/v4';
+import { MockMemory } from '../../../../memory';
+import type { MastraOnFinishCallbackArgs } from '../../../../stream/types';
 import { createTool } from '../../../../tools';
-import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
+import { createSharedAgent, runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
 
 /**
  * Regression class: onFinish callback.
@@ -75,10 +77,7 @@ describeForAllEngines(
       expect(resultSteps![0].text).toBe('Test response.');
     });
 
-    // Durable and evented hand onFinish raw tool-result payloads instead of chunks (#27428).
-    const itFailsOnDurableToolResults = engine === 'durable' || engine === 'evented' ? it.fails : it;
-
-    itFailsOnDurableToolResults('onFinish fires after tool execution', async () => {
+    it('onFinish exposes tool calls and results as chunks at run and step level (#27428)', async () => {
       const tickTool = createTool({
         id: 'tick',
         description: 'Advance a counter.',
@@ -87,7 +86,7 @@ describeForAllEngines(
         execute: async () => ({ count: 1 }),
       });
 
-      let toolResults: any[] | undefined;
+      const finishes: MastraOnFinishCallbackArgs[] = [];
 
       await runLoopScenario({
         engine,
@@ -95,8 +94,8 @@ describeForAllEngines(
         prompt: 'Call tool.',
         tools: { tick: tickTool },
         stopWhen: stepCountIs(3),
-        onFinish: (result: any) => {
-          toolResults = result.toolResults;
+        onFinish: result => {
+          finishes.push(result);
         },
         fixtures: llm => {
           llm.on(
@@ -107,11 +106,113 @@ describeForAllEngines(
         },
       });
 
-      expect(toolResults).toHaveLength(1);
-      expect(toolResults![0].type).toBe('tool-result');
-      expect(toolResults![0].payload.toolName).toBe('tick');
-      expect(toolResults![0].payload.result).toEqual({ count: 1 });
+      expect(finishes).toHaveLength(1);
+      const finish = finishes[0];
+      const toolCall = {
+        type: 'tool-call',
+        from: 'AGENT',
+        payload: { toolCallId: 'call_tick', toolName: 'tick', args: {} },
+      };
+      const toolResult = {
+        type: 'tool-result',
+        from: 'AGENT',
+        payload: { toolCallId: 'call_tick', toolName: 'tick', result: { count: 1 } },
+      };
+      expect(finish?.toolCalls).toMatchObject([toolCall]);
+      expect(finish?.toolResults).toMatchObject([toolResult]);
+      expect(finish?.steps[0]?.toolCalls).toMatchObject([toolCall]);
+      expect(finish?.steps[0]?.toolResults).toMatchObject([toolResult]);
     });
   },
   {},
+);
+
+describeForAllEngines(
+  'AIMock loop scenario: onFinish after resuming a tool',
+  engine => {
+    const getMock = useLoopScenarioAimock();
+
+    it.each([
+      { mode: 'separate steps', firstResult: 'success' },
+      { mode: 'same step', firstResult: 'success' },
+      { mode: 'separate steps', firstResult: 'error' },
+      { mode: 'same step', firstResult: 'error' },
+    ])(
+      'keeps completed tool results across suspension ($mode, first result: $firstResult, #27428)',
+      async ({ mode, firstResult }) => {
+        const tick = createTool({
+          id: 'tick',
+          description: 'Advance a counter, confirming the second increment.',
+          inputSchema: z.object({ count: z.number() }),
+          outputSchema: z.object({ count: z.number() }),
+          suspendSchema: z.object({}),
+          resumeSchema: z.object({ confirmed: z.boolean() }),
+          execute: async ({ count }, context) => {
+            if (count === 1 && firstResult === 'error') {
+              throw new Error('The first increment failed.');
+            }
+            if (count === 2 && !context?.agent?.resumeData?.confirmed) {
+              return context?.agent?.suspend({});
+            }
+            return { count };
+          },
+        });
+        const memory = new MockMemory();
+        const shared = await createSharedAgent(getMock(), { tools: { tick }, memory, engine });
+        const { output } = await runLoopScenario({
+          engine,
+          llm: getMock(),
+          sharedAgent: shared,
+          prompt: 'Increment the counter twice.',
+          memory,
+          threadId: 'on-finish-resume',
+          resourceId: 'on-finish-user',
+          stopWhen: stepCountIs(5),
+          fixtures: llm => {
+            const calls = [1, 2].map(count => ({ id: `tick-${count}`, name: 'tick', arguments: { count } }));
+            if (mode === 'same step') {
+              llm.on({ endpoint: 'chat', sequenceIndex: 0 }, { toolCalls: calls });
+            } else {
+              llm.on({ endpoint: 'chat', sequenceIndex: 0 }, { toolCalls: [calls[0]!] });
+              llm.on({ endpoint: 'chat', sequenceIndex: 1 }, { toolCalls: [calls[1]!] });
+            }
+            llm.on({ endpoint: 'chat', sequenceIndex: mode === 'same step' ? 1 : 2 }, { content: 'Counted to two.' });
+          },
+        });
+
+        const finishes: MastraOnFinishCallbackArgs[] = [];
+        const resumed = await shared.agent.resumeStream(
+          { confirmed: true },
+          {
+            runId: output.runId,
+            onFinish: result => {
+              finishes.push(result);
+            },
+          },
+        );
+        await resumed.consumeStream();
+
+        expect(finishes).toHaveLength(1);
+        const finish = finishes[0];
+        expect(finish?.text).toBe('Counted to two.');
+        const expectedResults = (firstResult === 'error' ? [2] : [1, 2]).map(count => ({
+          type: 'tool-result',
+          runId: output.runId,
+          from: 'AGENT',
+          payload: { toolCallId: `tick-${count}`, toolName: 'tick', result: { count } },
+        }));
+        expect(finish?.toolResults).toMatchObject(expectedResults);
+        expect(finish?.steps.flatMap(step => step.toolResults)).toMatchObject(expectedResults);
+        const expectedCalls = [1, 2].map(count => ({
+          type: 'tool-call',
+          runId: output.runId,
+          from: 'AGENT',
+          payload: { toolCallId: `tick-${count}`, toolName: 'tick', args: { count } },
+        }));
+        expect(finish?.toolCalls).toMatchObject(expectedCalls);
+        expect(finish?.steps.flatMap(step => step.toolCalls)).toMatchObject(expectedCalls);
+      },
+    );
+  },
+  { skip: ['fs'] },
 );

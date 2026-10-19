@@ -22,6 +22,9 @@ import type {
   LanguageModelUsage,
   StepStartPayload,
   ToolCallChunk,
+  ToolCallPayload,
+  ToolResultChunk,
+  ToolResultPayload,
 } from '../../stream/types';
 import type { AgentExecutionOptionsBase } from '../agent.types';
 import { MessageList } from '../message-list';
@@ -38,6 +41,7 @@ import type {
   AgentSuspendedEventData,
   AgentAbortEventData,
   AgentIterationCompleteEventData,
+  DurableToolCallOutput,
 } from './types';
 
 const STREAM_ENDING_EVENT_TYPES = new Set<string>([
@@ -90,20 +94,29 @@ export function createRunGenerationFilter({
   };
 }
 
-/**
- * Map workflow usage (which may use legacy promptTokens/completionTokens) to
- * the canonical LanguageModelUsage shape (inputTokens/outputTokens).
- */
+function mergeBufferedToolChunks<T extends ToolCallChunk | ToolResultChunk>(stored: T[], buffered: T[] = []): T[] {
+  const chunks = new Map(stored.map(chunk => [chunk.payload.toolCallId, chunk]));
+  for (const chunk of buffered) chunks.set(chunk.payload.toolCallId, chunk);
+  return [...chunks.values()];
+}
+
 /**
  * The run's serialized steps are the authoritative step list (a resumed segment's output only buffered
- * its own suffix), but only the buffered steps carry each step's `response` and `content` (#26780).
- * Overlay those onto the run steps, aligned from the last finished step.
+ * its own suffix). Overlay buffered responses, content and tool chunks onto those records,
+ * aligned from the last finished step. Earlier records need their raw tool payloads wrapped (#27428).
  */
 async function withBufferedStepResponses(
   runSteps: unknown[] | undefined,
   output: { steps: Promise<unknown[]> },
+  runId: string,
 ): Promise<unknown[]> {
-  const buffered = ((await output.steps.catch(() => undefined)) ?? []) as Record<string, unknown>[];
+  const buffered = ((await output.steps.catch(() => undefined)) ?? []) as {
+    response?: unknown;
+    content?: unknown;
+    finishReason?: string;
+    toolCalls?: ToolCallChunk[];
+    toolResults?: ToolResultChunk[];
+  }[];
   if (!runSteps?.length) return buffered;
   runSteps = expandDurableSteps(runSteps);
   // An aborted run ends with a step that never finished, so it was never buffered.
@@ -113,15 +126,44 @@ async function withBufferedStepResponses(
   const offset = runSteps.length - (trailingAborted ? 1 : 0) - buffered.length;
   return runSteps.map((step, i) => {
     const match = i >= offset ? buffered[i - offset] : undefined;
-    if (!match) return step;
+    const record = step as Record<string, unknown> & {
+      toolCalls?: ToolCallPayload[];
+      toolResults?: (ToolResultPayload &
+        Pick<DurableToolCallOutput, 'error' | 'aborted' | 'resultBlocked' | 'approval'>)[];
+    };
     return {
-      ...(step as Record<string, unknown>),
-      ...(match.response !== undefined ? { response: match.response } : {}),
-      ...(match.content !== undefined ? { content: match.content } : {}),
+      ...record,
+      ...(match?.response !== undefined ? { response: match.response } : {}),
+      ...(match?.content !== undefined ? { content: match.content } : {}),
+      toolCalls: mergeBufferedToolChunks<ToolCallChunk>(
+        (record.toolCalls ?? []).map(
+          ({ toolCallId, toolName, args, providerExecuted, providerMetadata, output, dynamic }) => ({
+            type: 'tool-call',
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: { toolCallId, toolName, args, providerExecuted, providerMetadata, output, dynamic },
+          }),
+        ),
+        match?.toolCalls,
+      ),
+      toolResults: mergeBufferedToolChunks<ToolResultChunk>(
+        (record.toolResults ?? [])
+          .filter(
+            result => !result.error && !result.aborted && !result.resultBlocked && result.approval?.approved !== false,
+          )
+          .map(({ toolCallId, toolName, args, result, providerExecuted, providerMetadata, dynamic }) => ({
+            type: 'tool-result',
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: { toolCallId, toolName, args, result, providerExecuted, providerMetadata, dynamic },
+          })),
+        match?.toolResults,
+      ),
     };
   });
 }
 
+/** Map workflow usage, including legacy token names, to the canonical usage shape. */
 function normalizeUsage(raw?: Record<string, unknown>): LanguageModelUsage {
   const inputTokens = (raw?.inputTokens as number | undefined) ?? (raw?.promptTokens as number | undefined);
   const outputTokens = (raw?.outputTokens as number | undefined) ?? (raw?.completionTokens as number | undefined);
@@ -595,7 +637,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
           // consume the stream (for example, resume() with a delay-only wait).
           if (finishReason === 'abort') {
             try {
-              const steps = onAbort ? await withBufferedStepResponses(data.output?.steps, output) : [];
+              const steps = onAbort ? await withBufferedStepResponses(data.output?.steps, output, runId) : [];
               await onAbort?.({
                 steps,
                 text: (data.output?.text ?? '') as string,
@@ -622,7 +664,7 @@ export function createDurableAgentStream<OUTPUT = undefined>(
             }
           } else if (onFinish) {
             try {
-              const steps = (await withBufferedStepResponses(data.output?.steps, output)) as any[];
+              const steps = (await withBufferedStepResponses(data.output?.steps, output, runId)) as any[];
               const allToolResults = steps.flatMap((s: any) => s?.toolResults ?? []);
               const allToolCalls = steps.flatMap((s: any) => s?.toolCalls ?? []);
               // The structured object is parsed while the output drains the (now closed) chunk
